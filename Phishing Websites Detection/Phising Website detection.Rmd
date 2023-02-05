@@ -1,0 +1,159 @@
+---
+title: "Data Mining Homework 2"
+author: "Sagarika Ugendhar, Thanh Pham, Vishnu Rahul"
+date: "10/29/2021"
+output: pdf_document
+---
+
+```{r load-packages, include=FALSE}
+library("tidyverse")
+library("randomForest")
+library("e1071")
+library("rpart")
+library("farff")
+library("caret")
+library("farff")
+library("ROSE")
+```
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r fileimport, include=TRUE, message=FALSE}
+knitr::opts_chunk$set(echo = T,results = "hide")
+Train <-readARFF("TrainingDataset.arff")
+Test <-readARFF("old.arff")
+```
+
+#Combine Data And Perform OverSampling to Balance the data 
+
+```{r combineData, include=TRUE}
+combined <- rbind(Train,Test)
+summary(combined$Result) #Unbalanced data
+combined.data <- ovun.sample(Result ~., combined, "over", N = 14500)$data # Performing Over Sampling  
+summary(combined.data$Result) #Balanced data
+```
+#Randomize the dataset due to Oversampling
+```{r Randomize, include=TRUE}
+set.seed(25)
+rows <- sample(nrow(combined.data))
+combined.data <- combined.data[rows,]
+```
+# Check for missing values
+
+```{r cleandata, include=TRUE}
+any_is_na = apply(combined, 2, function(x) any(is.na(x)))
+sum(any_is_na)
+```
+# Construct a decision tree, a naive bayes, and a random forest model
+# Use cross-validation to check the performance of your models
+
+```{r CrossValidation, include=TRUE}
+
+k<-10
+nmethod <- 4
+folds <- cut(seq(1,nrow(combined.data)),breaks=k,labels=FALSE)
+models.err <- matrix(-1,k,nmethod-1,dimnames=list(paste0("Fold", 1:k), 
+                                                  c("rf","dt","naiveBayes")))
+measure.model.dt <- matrix(-1,k,nmethod,dimnames=list(paste0("Fold", 1:k), 
+                                                      c("accur","recall","specificity","False Alarm")))
+measure.model.rf <- matrix(-1,k,nmethod,dimnames=list(paste0("Fold", 1:k), 
+                                                      c("accur","recall","specificity","False Alarm")))
+measure.model.nb <- matrix(-1,k,nmethod,dimnames=list(paste0("Fold", 1:k),
+                                                      c("accur","recall","specificity","False Alarm")))
+
+my.accuracy <- function(actual, prediction)
+{
+  y <- as.vector(table(prediction,actual))
+  names(y) <- c("TN","FP","FN","TP")
+  acur <- (y["TN"]+y["TP"])/sum(y)
+  TPR <- (y["TP"])/(y["TP"]+y["FN"])
+  TNR <- (y["TN"])/(y["TN"]+y["FP"])
+  FPR <- (y["FP"])/(y["TN"]+y["FP"])
+  FNR <- (y["FN"])/(y["FN"]+y["TP"])
+  rv1 <- c(acur, TPR, TNR, FPR,FNR)
+  return(rv1)
+}
+
+for(i in 1:k)
+{
+  testIndexes <- which(folds==i, arr.ind=TRUE) 
+  testData <- combined.data[testIndexes, ]
+  trainData <- combined.data[-testIndexes, ]
+  
+  rf <- randomForest(Result ~ ., data = trainData,
+                     ntree = 100,
+                     oob.prox=FALSE,
+                     mtry = sqrt(ncol(trainData) - 1))
+  predictedrf <- predict(rf, newdata = testData, type = "class")
+  models.err[i,1] <- mean(testData$Result != predictedrf)*100
+  measure.model.rf[i,"accur"] <- my.accuracy(testData$Result,predictedrf)[1]
+  measure.model.rf[i,"recall"] <- my.accuracy(testData$Result,predictedrf)[2]
+  measure.model.rf[i,"specificity"] <- my.accuracy(testData$Result,predictedrf)[3]
+  measure.model.rf[i,"False Alarm"] <- my.accuracy(testData$Result,predictedrf)[4]
+  
+  dt <- rpart(Result ~ ., data = trainData, parms = list(split = "information")
+              ,control=rpart.control(minsplit = 0, minbucket = 0, cp=-1))
+  predicteddt <- predict(dt, newdata = testData,type="class")
+  models.err[i,2] <- mean(testData$Result != predicteddt)*100
+  measure.model.dt[i,"accur"] <- my.accuracy(testData$Result,predicteddt)[1]
+  measure.model.dt[i,"recall"] <- my.accuracy(testData$Result,predicteddt)[2]
+  measure.model.dt[i,"specificity"] <- my.accuracy(testData$Result,predicteddt)[3]
+  measure.model.dt[i,"False Alarm"] <- my.accuracy(testData$Result,predicteddt)[4]
+  
+  nb <- naiveBayes(Result ~ ., trainData)
+  predictednb <- predict(nb, newdata = testData,type="class")
+  models.err[i,3] <-mean(testData$Result != predictednb)*100
+  measure.model.nb[i,"accur"] <- my.accuracy(testData$Result,predictednb)[1]
+  measure.model.nb[i,"recall"] <- my.accuracy(testData$Result,predictednb)[2]
+  measure.model.nb[i,"specificity"] <- my.accuracy(testData$Result,predictednb)[3]
+  measure.model.nb[i,"False Alarm"] <- my.accuracy(testData$Result,predictednb)[4]
+}
+```
+
+# Calculate the mean of Accuracy, Recall, Specificity and False Alarm for three models
+
+```{r choose the best model based on Evaluation Metrics, include=TRUE}
+Final <- matrix(c(mean(measure.model.dt[,"accur"]), 
+                  mean(measure.model.rf[,"accur"]), 
+                  mean(measure.model.nb[,"accur"]),
+                  mean(measure.model.dt[,"recall"]), 
+                  mean(measure.model.rf[,"recall"]), 
+                  mean(measure.model.nb[,"recall"]),
+                  mean(measure.model.dt[,"specificity"]),
+                  mean(measure.model.rf[,"specificity"]),
+                  mean(measure.model.nb[,"specificity"]),
+                  mean(measure.model.dt[,"False Alarm"]),
+                  mean(measure.model.rf[,"False Alarm"]),
+                  mean(measure.model.nb[,"False Alarm"])),ncol = 3,byrow=TRUE)
+colnames(Final) <- c("DecisionTree","RandomForest","NaiveBayes")
+rownames(Final) <- c("Accuracy","Recall","Specificity","FalseAlarm")
+Final <- as.table(Final)
+knitr::kable(Final)
+```
+
+## Choose the best model - Explanation
+
+Which model will be chosen as your final model? What evaluation measure(s) do you use to select
+the best model? Justify your answer.
+
+* Accuracy is the most popular classification measure, which is used to show the percentage of 
+websites that are correctly classified. 
+* Recall is the number of phishing websites correctly classified as phishing divided by the total 
+phishing websites. 
+* Specificity is the number of legitimate websites correctly classified as legitimate out of total 
+legitimate websites. 
+* False Alarm is the number of legitimate websites misclassified as phishing divided by the total 
+legitimate websites. 
+* False Negative rate is the number of phishing websites misclassified as legitimate divided by the
+total phishing websites.
+
+For better performance in detecting Phishing websites, the model should achieve high Accuracy, Recall, 
+and Specificity, and produce low False Alarm and FNR.
+
+Decision tree model appears to be the most appropriate model for detecting Phishing Website as it 
+achieves highest values for Accuracy, Recall, and Specificity compared to RandomForest and Naive Bayes 
+model. DecisionTree also has Low False Alarm compared to Random Forest. It unarguably provides efficient
+and credible means of maximizing the detection of compromised and malicious URLs
+
