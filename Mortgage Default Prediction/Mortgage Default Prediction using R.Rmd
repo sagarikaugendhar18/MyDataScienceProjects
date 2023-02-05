@@ -1,0 +1,861 @@
+---
+title: "HW3"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE,message=FALSE,error=FALSE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r install, include=TRUE}
+library("XLConnect")
+library("usdata")
+library(rpart)
+library(rpart.plot)
+library(reshape2)
+library(ggplot2)
+library(dplyr)
+library(ROSE)
+library(nnet)
+library(Rcpp)
+library(mltools)
+library(data.table)
+library(dummies)
+library(PRROC)
+library(pROC)
+library(lift)
+```
+
+## Read Data.Mortgage and Data.StateData  & combine the sheets 
+
+```{r main merge data, include=TRUE, warning=FALSE,error=FALSE}
+excel.file <- file.path("MortgageDefaultersData.xls")
+Data.Mortgage <- readWorksheetFromFile(excel.file, sheet=3)
+Data.StateData <- readWorksheetFromFile(excel.file, sheet=4, header = FALSE)
+Data.StateData <- tail(Data.StateData, -2)
+Data.StateData$Col3 <- NULL
+names(Data.StateData) <- c("State", "MedianIncome", "PercentOfPeopleInPoverty")
+Data.Mortgage$Col15 <- NULL
+Data.StateData$State <- ifelse(Data.StateData$State=='New Maxico',"New Mexico",
+                            ifelse(Data.StateData$State=='Districto Columbia',"District of Columbia",Data.StateData$State))
+Data.Mortgage$State <- abbr2state(Data.Mortgage$State)
+
+Data.Combined <- merge(x = Data.Mortgage, y = Data.StateData, by = "State", x.all = TRUE)
+Data.Combined$MedianIncome <- as.numeric(gsub(",", "", Data.Combined$MedianIncome))
+Data.Combined$LoanValuetoAppraised <- ifelse(is.na(Data.Combined$LoanValuetoAppraised),0,Data.Combined$LoanValuetoAppraised)
+
+knitr::kable(nrow(Data.Combined))
+```
+
+# Check for NA
+
+```{r NA, include=TRUE}
+any_is_na = apply(Data.Combined, 2, function(x) any(is.na(x)))
+sum(any_is_na)
+```
+
+# Data distribution for continuos variables using histogram
+```{r distribution, include=TRUE}
+par(mfrow=c(2,2))
+hist(Data.Combined$Orig_LTV_Ratio_Pct[Data.Combined$OUTCOME=="default"])
+hist(Data.Combined$Orig_LTV_Ratio_Pct[Data.Combined$OUTCOME=="non-default"])
+hist(Data.Combined$Credit_score[Data.Combined$OUTCOME=="default"])
+hist(Data.Combined$Credit_score[Data.Combined$OUTCOME=="non-default"])
+par(mfrow=c(2,2))
+hist(Data.Combined$DTI.Ratio[Data.Combined$OUTCOME=="default"])
+hist(Data.Combined$DTI.Ratio[Data.Combined$OUTCOME=="non-default"])
+hist(Data.Combined$LoanValuetoAppraised[Data.Combined$OUTCOME=="default"])
+hist(Data.Combined$LoanValuetoAppraised[Data.Combined$OUTCOME=="non-default"])
+```
+
+#Data distribution for categorical variables using two way table
+
+```{r table,include=TRUE}
+
+two_way = knitr::kable(table(Data.Combined$First_home, Data.Combined$OUTCOME))
+two_way
+
+two_way = knitr::kable(table(Data.Combined$State, Data.Combined$OUTCOME))
+two_way
+
+two_way = knitr::kable(table(Data.Combined$First_home, Data.Combined$OUTCOME))
+two_way
+
+```
+
+# Handling  Outliers by visually looking at Histogram
+
+```{r outliers, include=TRUE}
+hist(Data.Combined$Credit_score)
+Data.Combined = subset(Data.Combined, Data.Combined$Credit_score <= 850)
+Data.Combined = subset(Data.Combined, Data.Combined$Credit_score >= 300)
+hist(Data.Combined$Credit_score)
+
+hist(Data.Combined$Orig_LTV_Ratio_Pct)
+Data.Combined = subset(Data.Combined, Data.Combined$Orig_LTV_Ratio_Pct > 30)
+hist(Data.Combined$Orig_LTV_Ratio_Pct)
+```
+
+##Feature Engineering
+# Derived three new attributes 
+
+```{r new attributes, include=TRUE}
+Data.Combined$IsIncomeGreaterThanStateMedian <- ifelse(Data.Combined$Tot_mthly_incm*12>Data.Combined$MedianIncome,1,0)
+#Income is a good indicator of how a borrower would be able to repay the mortgage. If a person's income is below the state median then it could mean the the person is a high risk borrower
+
+
+Data.Combined$IsDTIgreaterto1 <- ifelse(Data.Combined$DTI.Ratio>1,1,0)
+#If DTI ratio is greater than 1, it implies a high risk borrower since the monthly debt repayments exceeds their income every month
+
+```
+
+#Remove redundant variables as they are derived fields in order to avoid repetition
+Removed attributes- Status, Tot_mthly_debt_exp, Tot_mthly_incm, Ln_Orig, orig_apprd_val_amt
+
+```{r removeredundant,include=TRUE}
+Data.Combined <- subset(Data.Combined, select = - c(Status,Tot_mthly_debt_exp,Tot_mthly_incm,Ln_Orig, orig_apprd_val_amt)) 
+```
+
+# As State is a Categorical variable with multiple levels, We are Using One hot encoder to create dummy variables for State 
+```{r DummyVariable, include=TRUE}
+Data.Combined <- cbind(Data.Combined,one_hot(as.data.table(as.factor(Data.Combined$State))))
+Data.Combined$First_home <- ifelse(Data.Combined$First_home=="Y",1,0)
+Data.Combined$UPB.Appraisal <- ifelse(Data.Combined$UPB.Appraisal=="1",1,0)
+Data.Combined$IsIncomeGreaterThanStateMedian <- ifelse(Data.Combined$IsIncomeGreaterThanStateMedian=="1",1,0)
+Data.Combined$OUTCOME <- as.factor(ifelse(Data.Combined$OUTCOME=="default","Default","NonDefault"))
+```
+
+#Check for Significant state variables out of 51 states by comparing the P-value to Alpha(0.01)
+```{r StateSignificanceTest,include=TRUE}
+ 
+Data <- Data.Combined %>%
+    select(starts_with('V1_'))
+CombinedStatistic <- 0
+for(i in 1:(ncol(Data))){
+Statistic <- data.frame("Row"=colnames(Data)[i], "Column"="OUTCOME",
+                     "Chi.Square"=chisq.test(Data[ ,i],Data.Combined$OUTCOME)$statistic,
+                     "df"=chisq.test(Data[ ,i], Data.Combined$OUTCOME)$parameter,
+                     "p.value"=chisq.test(Data[ ,i], Data.Combined$OUTCOME)$p.value,
+                      row.names=NULL)
+temp <- rbind(CombinedStatistic, Statistic)
+CombinedStatistic <- temp
+}
+
+A=0.01 #Assume Alpha is 0.01
+SignificantStateVariable<- as.data.frame( CombinedStatistic %>% filter(CombinedStatistic$p.value<A))
+knitr::kable(SignificantStateVariable)
+```
+
+
+#Create a new data set Data_sig with all other variables and SignificantStateVariable(instead of State variable) retrived from above 
+
+#Data_Sig consists of all variables except the redundant variables & "SignificantStateVariable" instead of State
+
+```{r SignificantData, include=TRUE}
+
+ Data_Sig <- Data.Combined %>% select (Bo_Age,Orig_LTV_Ratio_Pct,Credit_score,First_home,pur_prc_amt,DTI.Ratio,OUTCOME,UPB.Appraisal,LoanValuetoAppraised,MedianIncome,PercentOfPeopleInPoverty,IsIncomeGreaterThanStateMedian,IsDTIgreaterto1,V1_California,V1_Florida,V1_Georgia,V1_Indiana,V1_Texas,`V1_West Virginia`)
+
+Data_Sig$PercentOfPeopleInPoverty <- as.numeric(Data_Sig$PercentOfPeopleInPoverty)
+names(Data_Sig)[19] <- "V1_WestVirginia"
+```
+
+--------------LOGISTIC REGRESSION MODEL----------------
+
+#Variable selection for Logistic Regression using "Stepwise direction" method
+
+```{r LRVariable selection, include=TRUE}
+full <- glm(OUTCOME ~., data = Data_Sig, family="binomial")
+null <- glm(OUTCOME ~ 1, data = Data_Sig, family="binomial")
+
+step(null, scope = list(lower = null, upper = full), direction = "both")
+```
+
+# We are selecting variables for Logistic regression from Stepwise selection method by looking at the AIC value. Smaller the AIC, better the model. 
+```{r LRfinal variables,include=TRUE}
+    LR_Data <- Data_Sig %>% select (Credit_score,First_home,DTI.Ratio,OUTCOME,LoanValuetoAppraised,MedianIncome,V1_California,V1_Florida,V1_Georgia,V1_Indiana,V1_Texas,V1_WestVirginia)
+```
+
+#Cleanup the console  
+```{r cleanup, include=FALSE}
+rm(full,null,CombinedStatistic,Data,Data.Mortgage,Data.StateData,SignificantStateVariable,Statistic,Data.Combined,temp)
+```
+
+#split data to train and test
+```{r Split Data, include=TRUE}
+index <- sample(2, nrow(LR_Data), replace = TRUE, prob = c(0.75,0.25))
+train_LR <- LR_Data[index == 1,]
+test_LR <- LR_Data[index == 2,]
+```
+
+# Cross validation for Logistic Regression - TrgA dataset and undersampling the majority class for each folds
+
+```{r TrgACrossValidation,include=TRUE, warning=FALSE,error=FALSE}
+k <- 10
+TrgA <- train_LR %>% mutate(rand = runif(n = nrow(train_LR))) 
+TrgA <- TrgA %>% arrange(rand) 
+TrgA <- TrgA %>% select(-rand)
+
+fold_indices <- rep(1:k, each = nrow(TrgA)/k)
+
+CV_Result_TrgA <- data.frame(fold = as.numeric(), 
+                      threshold = as.numeric(),
+                      recall = as.numeric(),
+                      precision = as.numeric(),
+                      OverallAccuracy = as.numeric(),
+                      auc_roc_test = as.numeric(), 
+                      auc_pr_test = as.numeric())
+for(i in 1:k){
+  print(i)
+  train_CV <- TrgA[fold_indices != i, ]
+  test_CV <- TrgA[fold_indices == i, ]
+  
+  train_CV <- ovun.sample(OUTCOME~., data=train_CV, p=0.3, seed=1, method = "under")$data
+  
+  TrgA_LR_model <- glm(OUTCOME ~ ., data = train_CV, family = "binomial")
+  train_LR_predictions <- TrgA_LR_model$fitted.values
+  test_LR_predictions <- predict(TrgA_LR_model, newdata = test_CV, type = "response")
+  
+  
+  prcurve <- pr.curve(scores.class0 = test_LR_predictions,
+                      weights.class0 = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))),
+                      curve = T)
+  
+  roc <- roc(test_CV$OUTCOME, test_LR_predictions)
+  threshold <- as.numeric(coords(roc, "best", ret = "threshold"))
+  
+  binarypred <- ifelse(test_LR_predictions>= threshold, 1, 0)
+  confusionmatrix <- table(Actual = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))), Pred = binarypred)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- sum(binarypred == as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))))/nrow(test_CV)
+  
+  # Record Results
+  CV_Result_TrgA[i, ] <- c(fold = i, 
+                    threshold = threshold, 
+                    recall = recall, 
+                    precision = precision, 
+                    OverallAccuracy = accuracy,
+                    auc_roc_test = roc$auc, 
+                    auc_pr_test = as.numeric(prcurve$auc.integral))
+  
+rm(train_CV, test_CV,train_LR_predictions,test_LR_predictions, confusionmatrix, recall, precision, accuracy,threshold,auc_roc_test,auc_pr_test)
+}
+ knitr::kable(CV_Result_TrgA)
+```
+
+# Check the model accuracy for Logistic Regression on Test data for TrgA model
+        
+```{r TrgATestmodel, include=TRUE}  
+TrgA_test_model_predict <- predict(TrgA_LR_model, newdata = test_LR, type = "response")
+
+
+roc <- roc(test_LR$OUTCOME, TrgA_test_model_predict)
+  threshold <- as.numeric(coords(roc, "best", ret = "threshold"))
+  # as.numeric(roc$auc)
+  
+  binarypred <- ifelse(TrgA_test_model_predict>= threshold, 1, 0)
+  confusionmatrix <- table(Actual = as.numeric(as.character(ifelse(test_LR$OUTCOME=="Default",1,0))), Pred = binarypred)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- sum(binarypred == as.numeric(as.character(ifelse(test_LR$OUTCOME=="Default",1,0))))/nrow(test_LR)
+  
+  LR_Results_TrgA_model <- data.frame(threshold = as.numeric(threshold),
+                      recall = as.numeric(recall),
+                      precision = as.numeric(precision),
+                      accuracy = as.numeric(accuracy), 
+                      auc_roc_test = as.numeric(roc$auc), 
+                      auc_pr_test = as.numeric(prcurve$auc.integral))
+  
+  knitr::kable(LR_Results_TrgA_model)
+                      
+```
+
+#Lift curve for TrgA Dataset 
+```{r TrgA Lift curve, include=TRUE}
+  plotLift(TrgA_test_model_predict, 
+         as.numeric(as.character(ifelse(test_LR$OUTCOME=="Default",1,0))), 
+         cumulative = TRUE, 
+         n.buckets = 10, 
+         main = "Lift Curve by Decile",
+         col = "blue")
+```
+
+# Cross validation for for Logistic Regression on TrgB dataset and undersampling the majority class for each folds
+```{r TrgBCrossValidation,include=TRUE}
+k <- 10
+TrgB <- train_LR %>% mutate(rand = runif(n = nrow(train_LR))) 
+TrgB <- TrgB %>% arrange(rand) 
+TrgB <- TrgB %>% select(-rand)
+
+fold_indices <- rep(1:k, each = nrow(TrgB)/k)
+
+CV_Result_TrgB <- data.frame(fold = as.numeric(), 
+                      threshold = as.numeric(),
+                      recall = as.numeric(),
+                      precision = as.numeric(),
+                      accuracy = as.numeric(), 
+                      auc_roc_test = as.numeric(), 
+                      auc_pr_test = as.numeric())
+for(i in 1:k){
+  print(i)
+  train_CV <- TrgB[fold_indices != i, ]
+  test_CV <- TrgB[fold_indices == i, ]
+  
+  train_CV <- ovun.sample(OUTCOME~., data=train_CV, p=0.1, seed=1, method = "under")$data
+  
+  TrgB_LR_model <- glm(OUTCOME ~ ., data = train_CV, family = "binomial")
+  train_LR_predictions <- TrgB_LR_model$fitted.values
+  test_LR_predictions <- predict(TrgB_LR_model, newdata = test_CV, type = "response")
+  
+  prcurve <- pr.curve(scores.class0 = test_LR_predictions,
+                      weights.class0 = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))),
+                      curve = T)
+  
+  roc <- roc(test_CV$OUTCOME, test_LR_predictions)
+  threshold <- as.numeric(coords(roc, "best", ret = "threshold"))
+  
+  binarypred <- ifelse(test_LR_predictions>= threshold, 1, 0)
+  confusionmatrix <- table(Actual = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))), Pred = binarypred)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- sum(binarypred == as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))))/nrow(test_CV)
+  
+  # Record Results
+  CV_Result_TrgB[i, ] <- c(fold = i, 
+                    threshold = threshold, 
+                    recall = recall, 
+                    precision = precision, 
+                    accuracy = accuracy, 
+                    auc_roc_test = roc$auc, 
+                    auc_pr_test = as.numeric(prcurve$auc.integral))
+  
+}
+knitr::kable(CV_Result_TrgB)
+```
+
+# Check the model accuracy for Logistic Regression on Test data for TrgB model
+        
+```{r Test model, include=TRUE}  
+#train_LR_predictions <- TrgB_LR_model$fitted.values
+TrgB_test_model_predict <- predict(TrgB_LR_model, newdata = test_LR, type = "response")
+
+
+roc <- roc(test_LR$OUTCOME, TrgB_test_model_predict)
+  threshold <- as.numeric(coords(roc, "best", ret = "threshold"))
+  # as.numeric(roc$auc)
+  
+  binarypred <- ifelse(TrgB_test_model_predict>= threshold, 1, 0)
+  confusionmatrix <- table(Actual = as.numeric(as.character(ifelse(test_LR$OUTCOME=="Default",1,0))), Pred = binarypred)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- sum(binarypred == as.numeric(as.character(ifelse(test_LR$OUTCOME=="Default",1,0))))/nrow(test_LR)
+  
+  LR_Results_TrgB_model <- data.frame(threshold = as.numeric(threshold),
+                      recall = as.numeric(recall),
+                      precision = as.numeric(precision),
+                      accuracy = as.numeric(accuracy), 
+                      auc_roc_test = as.numeric(roc$auc), 
+                      auc_pr_test = as.numeric(prcurve$auc.integral))
+  
+  knitr::kable(LR_Results_TrgB_model)                    
+```
+
+#Lift curve for TrgB Dataset 
+```{r LR lift curve, include=TRUE}
+plotLift(TrgB_test_model_predict, 
+         as.numeric(as.character(ifelse(test_LR$OUTCOME=="Default",1,0))), 
+         cumulative = TRUE, 
+         n.buckets = 10, 
+         main = "Lift Curve by Decile",
+         col = "blue")
+```
+
+
+
+-------------------NEURAL NETWORK MODEL-----------------
+
+#Seperate the Numerical variables & Normalize the dataset using Min Max approach
+#Input to Neural network model must be Normalized
+
+```{r Normalize,include=TRUE}
+    
+num_cols <- unlist(lapply(Data_Sig, is.numeric))
+
+DataNum <- Data_Sig[,num_cols]
+
+mins <- apply(DataNum, 2, min)
+#quantile <- apply(DataNum, 2, quantile, probs=c(.99))
+maxs <- apply(DataNum, 2, max )
+
+
+scaled.data <- as.data.frame(scale(DataNum, center = mins, scale = maxs))
+
+#put back the factor values
+Data_Sig <- data.frame(scaled.data, Data_Sig[!num_cols])
+```
+
+#split data to train and test
+```{r NNSplit Data, include=TRUE}
+index <- sample(2, nrow(Data_Sig), replace = TRUE, prob = c(0.75,0.25))
+train_NN <- Data_Sig[index == 1,]
+test_NN <- Data_Sig[index == 2,]
+```
+
+
+# # Cross validation for Neural Network - TrgA dataset and undersampling the majority class for each folds
+```{r NNCross Validation,include=TRUE}
+k <- 10
+TrgA <- train_NN %>% mutate(rand = runif(nrow(train_NN))) 
+TrgA <- TrgA %>% arrange(rand) 
+TrgA <- TrgA %>% select(-rand)
+
+fold_indices <- rep(1:k, each = nrow(TrgA)/k)
+
+CrossResultsA <- data.frame(fold = as.numeric(), 
+                      threshold = as.numeric(),
+                      recall = as.numeric(),
+                      precision = as.numeric(),
+                      accuracy = as.numeric(), 
+                      auc_roc_test = as.numeric(), 
+                      auc_pr_test = as.numeric())
+for(i in 1:k){
+  print(i)
+  train_CV <- TrgA[fold_indices != i, ]
+  test_CV <- TrgA[fold_indices == i, ]
+  
+  train_CV <- ovun.sample(OUTCOME~., data=train_CV, p=0.3, seed=1, method = "under")$data
+  
+  TrgA_NN_model <-  nnet(OUTCOME ~ . , data = train_CV, size = 10, decay = 5e-5,maxit=1000,MaxNWts=2000, abstol = 1.0e-4, reltol = 1.0e-8)
+  train_NN_predictions <- TrgA_NN_model$fitted.values
+  test_NN_predictions <- predict(TrgA_NN_model, newdata = test_CV, type = "raw")
+
+  prcurve <- pr.curve(scores.class0 = test_NN_predictions,
+                      weights.class0 = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))),
+                      curve = T)
+  
+  roc <- roc(test_CV$OUTCOME, test_NN_predictions)
+  threshold <- as.numeric(coords(roc, "best", ret = "threshold"))
+  # as.numeric(roc$auc)
+  
+  binarypred <- ifelse(test_NN_predictions>= threshold, 1, 0)
+  confusionmatrix <- table(Actual = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))), Pred = binarypred)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- sum(binarypred == as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))))/nrow(test_CV)
+  
+  # Record Results
+  CrossResultsA[i, ] <- c(fold = i, 
+                    threshold = threshold, 
+                    recall = recall, 
+                    precision = precision, 
+                    accuracy = accuracy, 
+                    auc_roc_test = roc$auc, 
+                    auc_pr_test = as.numeric(prcurve$auc.integral))
+ 
+}
+knitr::kable(CrossResultsA)
+```
+
+# Check the model accuracy for Neural Network on Test data for TrgA model
+        
+```{r NNTest model, include=TRUE}  
+#train_LR_predictions <- TrgA_LR_model$fitted.values
+test_model_predict <- predict(TrgA_NN_model, newdata = test_NN, type = "raw")
+
+
+roc <- roc(test_NN$OUTCOME, test_model_predict)
+  threshold <- as.numeric(coords(roc, "best", ret = "threshold"))
+  # as.numeric(roc$auc)
+  
+  binarypred <- ifelse(test_model_predict>= threshold, 1, 0)
+  confusionmatrix <- table(Actual = as.numeric(as.character(ifelse(test_NN$OUTCOME=="Default",1,0))), Pred = binarypred)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- sum(binarypred == as.numeric(as.character(ifelse(test_NN$OUTCOME=="Default",1,0))))/nrow(test_NN)
+  
+  Results_TrgA_model <- data.frame(threshold = as.numeric(threshold),
+                      recall = as.numeric(recall),
+                      precision = as.numeric(precision),
+                      accuracy = as.numeric(accuracy), 
+                      auc_roc_test = as.numeric(roc$auc), 
+                      auc_pr_test = as.numeric(prcurve$auc.integral))
+  
+  knitr::kable(Results_TrgA_model)                    
+```
+
+#Lift curve for TrgA Dataset 
+```{r NN Lift curve, include=TRUE}
+  plotLift(test_model_predict, 
+         as.numeric(as.character(ifelse(test_NN$OUTCOME=="Default",1,0))), 
+         cumulative = TRUE, 
+         n.buckets = 10, 
+         main = "Lift Curve by Decile",
+         col = "blue")
+```
+
+
+
+# Cross validation for Neural Network - TrgB dataset and undersampling the majority class for each folds
+```{r NN TRGBCross Validation,include=TRUE}
+k <- 10
+TrgB <- train_NN %>% mutate(rand = runif(n = nrow(train_NN))) 
+TrgB <- TrgB %>% arrange(rand) 
+TrgB <- TrgB %>% select(-rand)
+
+fold_indices <- rep(1:k, each = nrow(TrgB)/k)
+
+CrossResultsB <- data.frame(fold = as.numeric(), 
+                      threshold = as.numeric(),
+                      recall = as.numeric(),
+                      precision = as.numeric(),
+                      accuracy = as.numeric(), 
+                      auc_roc_test = as.numeric(), 
+                      auc_pr_test = as.numeric())
+for(i in 1:k){
+  print(i)
+  train_CV <- TrgB[fold_indices != i, ]
+  test_CV <- TrgB[fold_indices == i, ]
+  
+  train_CV <- ovun.sample(OUTCOME~., data=train_CV, p=0.1, seed=1, method = "under")$data
+  
+  TrgB_NN_model <-  nnet(OUTCOME ~ . , data = train_CV, size = 10, decay = 5e-4, maxit=3000)
+  train_NN_predictions <- TrgB_NN_model$fitted.values
+  test_NN_predictions <- predict(TrgB_NN_model, newdata = test_CV, type = "raw")
+  
+  prcurve <- pr.curve(scores.class0 = test_NN_predictions,
+                      weights.class0 = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))),
+                      curve = T)
+  
+  roc <- roc(test_CV$OUTCOME, test_NN_predictions)
+  threshold <- as.numeric(coords(roc, "best", ret = "threshold"))
+  # as.numeric(roc$auc)
+  
+  binarypred <- ifelse(test_NN_predictions>= threshold, 1, 0)
+  confusionmatrix <- table(Actual = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))), Pred = binarypred)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- sum(binarypred == as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))))/nrow(test_CV)
+  
+  # Record Results
+  CrossResultsB[i, ] <- c(fold = i, 
+                    threshold = threshold, 
+                    recall = recall, 
+                    precision = precision, 
+                    accuracy = accuracy, 
+                    auc_roc_test = roc$auc, 
+                    auc_pr_test = as.numeric(prcurve$auc.integral))
+  
+}
+knitr::kable(CrossResultsB)
+```
+
+# Check the model accuracy for Neural Network on Test data for TrgB model
+        
+```{r NN TRGBTest model, include=TRUE}  
+#train_LR_predictions <- TrgB_LR_model$fitted.values
+test_model_predict <- predict(TrgB_NN_model, newdata = test_NN, type = "raw")
+
+
+roc <- roc(test_NN$OUTCOME, test_model_predict)
+  threshold <- as.numeric(coords(roc, "best", ret = "threshold"))
+  # as.numeric(roc$auc)
+  
+  binarypred <- ifelse(test_model_predict>= threshold, 1, 0)
+  confusionmatrix <- table(Actual = as.numeric(as.character(ifelse(test_NN$OUTCOME=="Default",1,0))), Pred = binarypred)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- sum(binarypred == as.numeric(as.character(ifelse(test_NN$OUTCOME=="Default",1,0))))/nrow(test_NN)
+  
+  Results_TrgB_model <- data.frame(threshold = as.numeric(threshold),
+                      recall = as.numeric(recall),
+                      precision = as.numeric(precision),
+                      accuracy = as.numeric(accuracy), 
+                      auc_roc_test = as.numeric(roc$auc), 
+                      auc_pr_test = as.numeric(prcurve$auc.integral))
+  knitr::kable(Results_TrgB_model)
+                      
+```
+
+#Lift curve for TrgB Dataset 
+```{r NN TRGB lift curve, include=TRUE}
+plotLift(test_model_predict, 
+         as.numeric(as.character(ifelse(test_NN$OUTCOME=="Default",1,0))), 
+         cumulative = TRUE, 
+         n.buckets = 10, 
+         main = "Lift Curve by Decile",
+         col = "blue")
+```
+
+-----------------------DECISION TREE--------------------------
+## Read Data.Mortgage and Data.StateData  & combine the sheets 
+
+```{r merge data, include=TRUE, warning=FALSE,error=FALSE}
+excel.file <- file.path("MortgageDefaultersData.xls")
+Data.Mortgage <- readWorksheetFromFile(excel.file, sheet=3)
+Data.StateData <- readWorksheetFromFile(excel.file, sheet=4, header = FALSE)
+Data.StateData <- tail(Data.StateData, -2)
+Data.StateData$Col3 <- NULL
+names(Data.StateData) <- c("State", "MedianIncome", "PercentOfPeopleInPoverty")
+Data.Mortgage$Col15 <- NULL
+Data.Mortgage$State <- abbr2state(Data.Mortgage$State)
+Data.StateData$State <- ifelse(Data.StateData$State=='New Maxico',"New Mexico",
+                            ifelse(Data.StateData$State=='Districto Columbia',"District of Columbia",Data.StateData$State))
+Data.Combined_FT <- merge(x = Data.Mortgage, y = Data.StateData, by = "State", x.all = TRUE)
+Data.Combined_FT$MedianIncome <- as.numeric(gsub(",", "", Data.Combined_FT$MedianIncome))
+Data.Combined_FT$LoanValuetoAppraised <- ifelse(is.na(Data.Combined_FT$LoanValuetoAppraised),0,Data.Combined_FT$LoanValuetoAppraised)
+#Data.Combined_FT$OUTCOME_Num <- ifelse(Data.Combined_FT$OUTCOME=="default",1,0)
+```
+
+# Check for NA
+
+```{r DT NA, include=TRUE}
+any_is_na = apply(Data.Combined_FT, 2, function(x) any(is.na(x)))
+any_is_na
+sum(any_is_na)
+```
+
+
+# Derived new attributes 
+
+```{r DT new attributes, include=TRUE}
+Data.Combined_FT$IsIncomeGreaterThanStateMedian <- ifelse(Data.Combined_FT$Tot_mthly_incm*12>Data.Combined_FT$MedianIncome,1,0)
+#Income is a good indicator of how a borrower would be able to repay the mortgage. If a person's income is below the state median then it could mean the the person is a high risk borrower
+
+#Same as the above variable just in a different format 
+#Data.Combined_FT$IncomeToMedianIncomeRatio <- Data.Combined_FT$Tot_mthly_incm*12 / Data.Combined_FT$MedianIncome
+ 
+Data.Combined_FT$IsDTIgreaterto1 <- ifelse(Data.Combined_FT$DTI.Ratio>1,1,0)
+#If DTI ratio is greater than 1, it implies a high risk borrower since the monthly debt repayments exceeds their income every month
+
+```
+
+#Remove redundant variables as they are derived fields in order to avoid repetition
+
+#Status, Tot_mthly_debt_exp, Tot_mthly_incm, Ln_Orig, orig_apprd_val_amt
+```{r DTremoveredundant,include=TRUE}
+Data.Combined_FT <- subset(Data.Combined_FT, select = - c(Status,State,Tot_mthly_debt_exp,Tot_mthly_incm,Ln_Orig, orig_apprd_val_amt,PercentOfPeopleInPoverty, MedianIncome)) 
+```
+
+
+```{r DTDummyVariable}
+Data.Combined_FT$First_home <- ifelse(Data.Combined_FT$First_home=="Y",1,0)
+Data.Combined_FT$UPB.Appraisal <- ifelse(Data.Combined_FT$UPB.Appraisal=="1",1,0)
+Data.Combined_FT$IsIncomeGreaterThanStateMedian <- ifelse(Data.Combined_FT$IsIncomeGreaterThanStateMedian=="1",1,0)
+Data.Combined_FT$OUTCOME <- as.factor(ifelse(Data.Combined_FT$OUTCOME=="default","Default","NonDefault"))
+#Data.Combined_FT <- cbind(Data.Combined_FT,one_hot(as.data.table(as.factor(Data.Combined_FT$State))))
+```
+
+
+###Decision Tree
+#split dataDT into train and test
+```{r DTsplit data, include=TRUE}
+set.seed(125)
+index <- sample(2, nrow(Data.Combined_FT), replace = TRUE, prob = c(0.75,0.25))
+train_data <- Data.Combined_FT[index == 1,]
+test_data <- Data.Combined_FT[index == 2,]
+```
+
+# Cross Validation for TrgA - Decision Tree
+```{r DTCV TrgA, include=TRUE}  
+k <- 10
+TrgA <- train_data %>% mutate(rand = runif(n = nrow(train_data))) 
+TrgA <- TrgA %>% arrange(rand) 
+TrgA <- TrgA %>% select(-rand)
+
+fold_indices <- rep(1:k, each = nrow(TrgA)/k)
+
+ResultsA <- data.frame(fold = as.numeric(), 
+                      threshold = as.numeric(),
+                      recall = as.numeric(),
+                      precision = as.numeric(),
+                      accuracy = as.numeric(), 
+                      auc_roc_test = as.numeric(), 
+                      auc_pr_test = as.numeric())
+for(i in 1:k){
+  print(i)
+  train_CV <- TrgA[fold_indices != i, ]
+  test_CV <- TrgA[fold_indices == i, ]
+  
+  train_CV <- ovun.sample(OUTCOME ~ ., data=train_CV, p=0.3, seed=1, method = "under")$data
+  
+  TrgA_DT_model <- rpart(OUTCOME ~ .
+                     , data =  train_CV
+                     , parms = list(split = "information")
+                     ,control=rpart.control(minsplit = 6, minbucket = 2,maxdepth=8 ,cp=-1))
+ 
+  train_DT_predictions <- TrgA_DT_model$fitted.values
+  
+  predicteddt_TrgA <- predict( TrgA_DT_model, newdata = test_CV,type="class")
+  predicteddt1_TrgA <- predict( TrgA_DT_model, newdata = test_CV, type = "prob")[,2]
+  aucdt_a <- auc(test_CV$OUTCOME, predicteddt1_TrgA)
+  mean(test_CV$OUTCOME != predicteddt_TrgA)*100
+  
+  confusionmatrix <- table(Actual = test_CV$OUTCOME, Pred = predicteddt_TrgA)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- (sum(predicteddt_TrgA == test_CV$OUTCOME))/nrow(test_CV)
+  prcurve <- pr.curve(scores.class0 = predicteddt1_TrgA,
+                      weights.class0 = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))),
+                      curve = T)
+  
+  roc <- roc(as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))), predicteddt1_TrgA)
+  threshold <- coords(roc, "best", ret = "threshold")
+  # Record Results
+  ResultsA[i, ] <- c(fold = i, 
+                    threshold = threshold, 
+                    recall = recall, 
+                    precision = precision, 
+                    accuracy = accuracy, 
+                    auc_roc_test = roc$auc, 
+                    auc_pr_test = as.numeric(prcurve$auc.integral))
+  
+}
+knitr::kable(ResultsA)
+```
+# Check the model accuracy on Test data for TrgA model - Decision tree
+```{r DT accuracy, include=TRUE}
+predicteddt_TrgA <- predict(TrgA_DT_model, newdata = test_data,type="class")
+predicteddt1_TrgA <- predict( TrgA_DT_model, newdata = test_data, type = "prob")[,2]
+confusionmatrix <- table(Actual = test_data$OUTCOME, Pred = predicteddt_TrgA)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- (sum(predicteddt_TrgA == test_data$OUTCOME))/nrow(test_data)
+  prcurve <- pr.curve(scores.class0 = predicteddt1_TrgA,
+                      weights.class0 = as.numeric(as.character(ifelse(test_data$OUTCOME=="Default",1,0))),
+                      curve = T)
+  
+  roc <- roc(as.numeric(as.character(ifelse(test_data$OUTCOME=="Default",1,0))), predicteddt1_TrgA)
+  threshold <- coords(roc, "best", ret = "threshold")
+  FinalResultsA <- data.frame(threshold = as.numeric(threshold), 
+                    recall = as.numeric(recall), 
+                    precision = as.numeric(precision), 
+                    accuracy = as.numeric(accuracy), 
+                    auc_roc_test = as.numeric(roc$auc), 
+                    auc_pr_test = as.numeric(prcurve$auc.integral))
+knitr::kable(FinalResultsA)
+
+  plotLift(predicteddt_TrgA, 
+         as.numeric(as.character(ifelse(test_data$OUTCOME=="Default",1,0))), 
+         cumulative = TRUE, 
+         n.buckets = 10, 
+         main = "Lift Curve by Decile",
+         col = "blue")
+```
+
+
+
+# Cross Validation for TrgB - Decision Tree
+```{r DTCV TrgB, include=TRUE}  
+k <- 10
+TrgB <- train_data %>% mutate(rand = runif(n = nrow(train_data))) 
+TrgB <- TrgB %>% arrange(rand) 
+TrgB <- TrgB %>% select(-rand)
+
+fold_indices <- rep(1:k, each = nrow(TrgB)/k)
+
+ResultsB <- data.frame(fold = as.numeric(), 
+                      threshold = as.numeric(),
+                      recall = as.numeric(),
+                      precision = as.numeric(),
+                      accuracy = as.numeric(), 
+                      auc_roc_test = as.numeric(), 
+                      auc_pr_test = as.numeric())
+for(i in 1:k){
+  print(i)
+  train_CV <- TrgB[fold_indices != i, ]
+  test_CV <- TrgB[fold_indices == i, ]
+  
+  train_CV <- ovun.sample(OUTCOME ~ ., data=train_CV, p=0.1, seed=1, method = "under")$data
+  
+  TrgB_DT_model <- rpart(OUTCOME ~ .
+                     , data =  train_CV
+                     , parms = list(split = "information")
+                     ,control=rpart.control(minsplit = 6, minbucket = 2,maxdepth=8 , cp=-1))
+ 
+  train_DT_predictions <- TrgB_DT_model$fitted.values
+  
+  predicteddt_TrgB <- predict( TrgB_DT_model, newdata = test_CV,type="class")
+  predicteddt1_TrgB <- predict( TrgB_DT_model, newdata = test_CV, type = "prob")[,2]
+  aucdt_a <- auc(test_CV$OUTCOME, predicteddt1_TrgB)
+  mean(test_CV$OUTCOME != predicteddt_TrgB)*100
+  
+  confusionmatrix <- table(Actual = test_CV$OUTCOME, Pred = predicteddt_TrgB)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- (sum(predicteddt_TrgB == test_CV$OUTCOME))/nrow(test_CV)
+  prcurve <- pr.curve(scores.class0 = predicteddt1_TrgB,
+                      weights.class0 = as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))),
+                      curve = T)
+  
+  roc <- roc(as.numeric(as.character(ifelse(test_CV$OUTCOME=="Default",1,0))), predicteddt1_TrgB)
+  threshold <- coords(roc, "best", ret = "threshold")
+  # Record Results
+  ResultsB[i, ] <- c(fold = i, 
+                    threshold = threshold, 
+                    recall = recall, 
+                    precision = precision, 
+                    accuracy = accuracy, 
+                    auc_roc_test = roc$auc, 
+                    auc_pr_test = as.numeric(prcurve$auc.integral))
+  
+  #rm(train_k, test_k, model, train_k_predictions, test_k_predictions, prcurve, roc, threshold,
+  #   binarypred, confusionmatrix, recall, precision, accuracy)
+
+  #print(Results)
+}
+knitr::kable(ResultsB)
+```
+
+
+# Check the model accuracy on Test data for TrgB model - Decision Tree
+```{r DT TRB accuracy, include=TRUE}
+predicteddt_TrgB <- predict(TrgB_DT_model, newdata = test_data,type="class")
+predicteddt1_TrgB <- predict(TrgB_DT_model, newdata = test_data, type = "prob")[,2]
+confusionmatrix <- table(Actual = test_data$OUTCOME, Pred = predicteddt_TrgB)
+  recall <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[2,1])
+  precision <- confusionmatrix[2,2] / (confusionmatrix[2,2] + confusionmatrix[1,2])
+  accuracy <- (sum(predicteddt_TrgB == test_data$OUTCOME))/nrow(test_data)
+  prcurve <- pr.curve(scores.class0 = predicteddt1_TrgB,
+                      weights.class0 = as.numeric(as.character(ifelse(test_data$OUTCOME=="Default",1,0))),
+                      curve = T)
+  
+  roc <- roc(as.numeric(as.character(ifelse(test_data$OUTCOME=="Default",1,0))), predicteddt1_TrgB)
+  threshold <- coords(roc, "best", ret = "threshold")
+  FinalResultsB <- data.frame(threshold = as.numeric(threshold), 
+                    recall = as.numeric(recall), 
+                    precision = as.numeric(precision), 
+                    accuracy = as.numeric(accuracy), 
+                    auc_roc_test = as.numeric(roc$auc), 
+                    auc_pr_test = as.numeric(prcurve$auc.integral))
+  plotLift(predicteddt_TrgB, 
+         as.numeric(as.character(ifelse(test_data$OUTCOME=="Default",1,0))), 
+         cumulative = TRUE, 
+         n.buckets = 10, 
+         main = "Lift Curve by Decile",
+         col = "blue")
+  knitr::kable(FinalResultsB)
+```
+
+# Final results for all models across TrgA and TrgB datasets
+```{r Final consolidation, include=TRUE}
+TrgA_results<- rbind(LR_Results_TrgA_model,Results_TrgA_model,FinalResultsA)
+TrgB_results<- rbind(LR_Results_TrgB_model,Results_TrgB_model,FinalResultsB)
+
+colnames(TrgA_results) <- c("Threshold","Recall","Precision","Accuracy","AUC_ROC_Test","AUC_PR_Test")
+rownames(TrgA_results) <- c("Logistic Regression TrgA","Neural Network TrgA","DecisionTree TrgA")
+
+colnames(TrgB_results) <- c("Threshold","Recall","Precision","Accuracy","AUC_ROC_Test","AUC_PR_Test")
+rownames(TrgB_results) <- c("Logistic Regression TrgB","Neural Network TrgB","DecisionTree TrgB")
+
+knitr::kable(TrgA_results)
+knitr::kable(TrgB_results)
+```
+In our case, Recall is a more important metric as opposed to Precision given that we are more concerned with false negatives (our model predicting that someone is not going to be default but they are) than false positives (our model predicting that someone is going to be default but they aren't). Recall is a more important because we would rather be over insured than under insured.
+
+Therefore, we would suggest that Logistic Regression is the best model
